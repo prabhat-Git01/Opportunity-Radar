@@ -1,4 +1,5 @@
 import { FetchedPageContent, SearchResultItem } from "./types";
+import { getEnv } from "./env";
 
 const SEARCH_API_URL = "https://api.search.tinyfish.ai";
 const FETCH_API_URL = "https://api.fetch.tinyfish.ai";
@@ -47,11 +48,11 @@ const limiter = new ConcurrencyLimiter(4);
 let hasLoggedFirstSearch = false;
 
 function getApiKey(): string {
-  const key = process.env.TINYFISH_API_KEY;
-  if (!key || key.trim() === "" || key.includes("your_tinyfish_api_key")) {
+  const key = getEnv("TINYFISH_API_KEY");
+  if (!key || key.includes("your_tinyfish_api_key")) {
     throw new Error("Your API key looks wrong");
   }
-  return key.trim();
+  return key;
 }
 
 /**

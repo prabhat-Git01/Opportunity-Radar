@@ -238,6 +238,7 @@ export default function OpportunityRadarPage() {
 
       if (!receivedDone) {
         setIsSearching(false);
+        setErrorMessage((prev) => prev || "The search session ended unexpectedly. Please try scanning again.");
       }
     } catch (err: any) {
       console.error("Search pipeline error:", err);

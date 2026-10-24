@@ -6,29 +6,56 @@ import {
   TriagedUrl,
   UnderstandingResult,
 } from "./types";
+import { getEnv } from "./env";
 
 function getGeminiClient(): { ai: GoogleGenAI; model: string } {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey.trim() === "" || apiKey.includes("your_gemini_api_key")) {
+  const apiKey = getEnv("GEMINI_API_KEY");
+  if (!apiKey || apiKey.includes("your_gemini_api_key")) {
     throw new Error("Missing or invalid GEMINI_API_KEY. Please set it in .env.local");
   }
-  const model = process.env.GEMINI_MODEL?.trim() || "gemini-3.5-flash";
+  const model = getEnv("GEMINI_MODEL", "gemini-3.5-flash");
   const ai = new GoogleGenAI({ apiKey: apiKey.trim() });
   return { ai, model };
 }
 
 /**
- * Clean and parse JSON returned from LLMs (handles markdown code fences if any)
+ * Clean and parse JSON returned from LLMs (handles markdown code fences and object wrappers)
  */
 function parseJsonFromText(rawText: string | undefined): any {
   if (!rawText) return null;
   let cleaned = rawText.trim();
-  if (cleaned.startsWith("```json")) {
-    cleaned = cleaned.replace(/^```json\s*/, "").replace(/\s*```$/, "");
+
+  // Strip markdown code fences if present
+  const jsonBlockMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (jsonBlockMatch) {
+    cleaned = jsonBlockMatch[1].trim();
   } else if (cleaned.startsWith("```")) {
-    cleaned = cleaned.replace(/^```\s*/, "").replace(/\s*```$/, "");
+    cleaned = cleaned.replace(/^```[a-z]*\s*/i, "").replace(/\s*```$/, "").trim();
   }
-  return JSON.parse(cleaned.trim());
+
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Try to extract first JSON array
+    const firstBracket = cleaned.indexOf("[");
+    const lastBracket = cleaned.lastIndexOf("]");
+    if (firstBracket !== -1 && lastBracket > firstBracket) {
+      try {
+        return JSON.parse(cleaned.slice(firstBracket, lastBracket + 1));
+      } catch {}
+    }
+
+    // Try to extract first JSON object
+    const firstBrace = cleaned.indexOf("{");
+    const lastBrace = cleaned.lastIndexOf("}");
+    if (firstBrace !== -1 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+      } catch {}
+    }
+
+    return null;
+  }
 }
 
 /**
@@ -46,17 +73,20 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
   }
 }
 
+// Global cache of models that have hit daily quota exhaustion, so subsequent calls skip them instantly
+const exhaustedModels = new Set<string>();
+
 /**
- * Helper to call NVIDIA Nemotron (via NVIDIA NIM or OpenRouter / OpenAI-compatible endpoint)
+ * Helper to call NVIDIA Nemotron (via NVIDIA NIM endpoint)
  */
 async function callNemotronJson(prompt: string): Promise<any> {
-  const apiKey = process.env.NEMOTRON_API_KEY?.trim();
+  const apiKey = getEnv("NEMOTRON_API_KEY");
   if (!apiKey || apiKey.includes("your_nemotron_api_key")) {
     throw new Error("NEMOTRON_API_KEY is not configured in .env.local");
   }
 
-  const baseUrl = (process.env.NEMOTRON_BASE_URL?.trim() || "https://integrate.api.nvidia.com/v1").replace(/\/+$/, "");
-  const model = process.env.NEMOTRON_MODEL?.trim() || "nvidia/nemotron-3.5-super-vl-120b-a12b";
+  const baseUrl = (getEnv("NEMOTRON_BASE_URL", "https://integrate.api.nvidia.com/v1")).replace(/\/+$/, "");
+  const model = getEnv("NEMOTRON_MODEL", "nvidia/nemotron-3.5-super-vl-120b-a12b");
 
   console.log(`[Nemotron] Calling model "${model}" via ${baseUrl}...`);
 
@@ -84,8 +114,8 @@ async function callNemotronJson(prompt: string): Promise<any> {
         max_tokens: 4096,
       }),
     }),
-    35000,
-    "Nemotron API request timed out after 35s"
+    20000,
+    "Nemotron API request timed out after 20s"
   );
 
   if (!response.ok) {
@@ -99,67 +129,59 @@ async function callNemotronJson(prompt: string): Promise<any> {
 }
 
 /**
- * Helper to call Gemini generateContent with retries and fallback to Nemotron
+ * Helper to call Gemini generateContent with retries and seamless fallback to Nemotron
  */
 async function callGeminiJson(prompt: string): Promise<any> {
   let geminiError: any = null;
-  const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
+  const geminiApiKey = getEnv("GEMINI_API_KEY");
+  const nemotronApiKey = getEnv("NEMOTRON_API_KEY");
 
-  // Try Gemini models if GEMINI_API_KEY is provided
+  // Check if we can use Gemini models
   if (geminiApiKey && !geminiApiKey.includes("your_gemini_api_key")) {
     try {
       const { ai, model: primaryModel } = getGeminiClient();
-      const modelsToTry = Array.from(
+      const candidateModels = Array.from(
         new Set([primaryModel, "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash"])
       );
 
+      // Only attempt models that haven't already failed with quota exhaustion
+      const modelsToTry = candidateModels.filter((m) => !exhaustedModels.has(m));
+
       for (const model of modelsToTry) {
-        for (let attempt = 0; attempt < 2; attempt++) {
-          try {
-            console.log(`[Gemini] Calling ${model} (attempt ${attempt + 1})...`);
-            const response = await withTimeout(
-              ai.models.generateContent({
-                model: model,
-                contents: prompt,
-                config: {
-                  responseMimeType: "application/json",
-                },
-              }),
-              25000,
-              `Model ${model} timed out after 25s`
-            );
+        try {
+          console.log(`[Gemini] Calling ${model}...`);
+          const response = await withTimeout(
+            ai.models.generateContent({
+              model: model,
+              contents: prompt,
+              config: {
+                responseMimeType: "application/json",
+              },
+            }),
+            12000,
+            `Model ${model} timed out after 12s`
+          );
 
-            return parseJsonFromText(response.text);
-          } catch (err: any) {
-            geminiError = err;
-            const errMsg = err?.message || "";
-            console.warn(`[Gemini] Model ${model} attempt ${attempt + 1} failed: ${errMsg}`);
+          const parsed = parseJsonFromText(response.text);
+          if (parsed !== null) {
+            return parsed;
+          }
+        } catch (err: any) {
+          geminiError = err;
+          const errMsg = err?.message || "";
+          console.warn(`[Gemini] Model ${model} failed: ${errMsg}`);
 
-            // If daily quota exceeded or model discontinued, do NOT retry this model; switch immediately
-            if (
-              errMsg.includes("per day") ||
-              errMsg.includes("exceeded your current quota") ||
-              errMsg.includes("not found") ||
-              errMsg.includes("no longer available")
-            ) {
-              console.log(`[Gemini] Model ${model} quota exhausted. Switching model...`);
-              break;
-            }
-
-            // If temporary RPM rate limit, wait 3s and retry once
-            if (errMsg.includes("requests per minute") || errMsg.includes("429")) {
-              console.log(`[Gemini] RPM limit on ${model}. Waiting 3s...`);
-              await new Promise((r) => setTimeout(r, 3000));
-              continue;
-            }
-
-            // If 503 high demand
-            if (errMsg.includes("503") || errMsg.includes("high demand")) {
-              await new Promise((r) => setTimeout(r, 2000));
-              continue;
-            }
-
-            break;
+          // If daily quota exceeded or model discontinued, mark model permanently exhausted for this session
+          if (
+            errMsg.includes("per day") ||
+            errMsg.includes("exceeded your current quota") ||
+            errMsg.includes("RESOURCE_EXHAUSTED") ||
+            errMsg.includes("GenerateRequestsPerDayPerProjectPerModel-FreeTier") ||
+            errMsg.includes("not found") ||
+            errMsg.includes("no longer available")
+          ) {
+            console.log(`[Gemini] Model ${model} daily quota exhausted. Blacklisting for session...`);
+            exhaustedModels.add(model);
           }
         }
       }
@@ -168,10 +190,9 @@ async function callGeminiJson(prompt: string): Promise<any> {
     }
   }
 
-  // Seamless fallback to Nemotron if Gemini failed or is unavailable
-  const nemotronKey = process.env.NEMOTRON_API_KEY?.trim();
-  if (nemotronKey && !nemotronKey.includes("your_nemotron_api_key")) {
-    console.log("[LLM Fallback] Gemini models unavailable, falling back to NVIDIA Nemotron...");
+  // Seamless fallback to Nemotron if Gemini failed or all Gemini models are exhausted
+  if (nemotronApiKey && !nemotronApiKey.includes("your_nemotron_api_key")) {
+    console.log("[LLM Fallback] Route request to NVIDIA Nemotron NIM...");
     try {
       return await callNemotronJson(prompt);
     } catch (nemotronErr: any) {
@@ -254,45 +275,67 @@ Extract and return a JSON object with this exact structure:
 
 /**
  * STEP 3: TRIAGE SEARCH RESULTS
- * Pick the 8 most promising URLs that look like a SPECIFIC opportunity page or a live listing page.
- * Reject listicles ("top 10", "best", "how to", "tips"), news recaps, winners/results pages and anything clearly past its date.
+ * Filter out blogs, forum posts, expired cycles, aggregate listicles without specifics.
+ * Keep ONLY direct links to actual opportunities or rich listing pages. Max 8 URLs.
  */
 export async function geminiTriage(
   searchResults: SearchResultItem[],
   keywords: string[]
 ): Promise<TriagedUrl[]> {
+  if (!searchResults || searchResults.length === 0) return [];
+
   console.log(`[Gemini Triage] Triaging ${searchResults.length} search results against keywords...`);
 
-  if (searchResults.length === 0) return [];
+  const prompt = `You are an AI assistant filtering search results to find current, live opportunity pages for Indian college students.
+Student keywords: ${keywords.join(", ")}
 
-  const prompt = `You are an expert opportunity scout for Indian students.
-Given the student's keywords: ${keywords.join(", ")}
-And these search results:
+Here are ${searchResults.length} search result candidates:
 ${JSON.stringify(
-  searchResults.map((r) => ({
+  searchResults.map((r, i) => ({
+    index: i,
     title: r.title,
     snippet: r.snippet,
     url: r.url,
-    date: r.date,
   })),
   null,
   2
 )}
 
-Pick the 8 most promising URLs that look like a SPECIFIC opportunity page or a live listing page.
-Reject listicles ("top 10", "best", "how to", "tips"), news recaps, blog articles, winners/results pages, and anything clearly past its date or expired.
+Instruction:
+Filter out:
+- Generic blog posts or listicles ("Top 10 internships in 2024")
+- Past or expired programs (dates prior to late 2026)
+- Career advice articles, YouTube videos, LinkedIn login walls
+- Empty or irrelevant pages
 
-Return a JSON array of up to 8 items:
+Keep ONLY:
+- Direct links to specific open opportunities with applications/deadlines
+- Live portal listing pages that contain multiple open opportunities matching the student's keywords
+
+Return a JSON array of up to 8 items in this format:
 [
   {
     "url": "https://...",
-    "reason": "specific reason why this URL is promising"
+    "reason": "why this page is promising"
   }
 ]`;
 
   try {
     const result = await callGeminiJson(prompt);
-    const triaged: TriagedUrl[] = Array.isArray(result) ? result : [];
+    let triagedArray: any[] = [];
+    if (Array.isArray(result)) {
+      triagedArray = result;
+    } else if (result && typeof result === "object") {
+      if (Array.isArray(result.triaged)) triagedArray = result.triaged;
+      else if (Array.isArray(result.urls)) triagedArray = result.urls;
+      else if (Array.isArray(result.results)) triagedArray = result.results;
+    }
+
+    const triaged: TriagedUrl[] = triagedArray.map((t: any) => ({
+      url: t.url || "",
+      reason: t.reason || "Matched student keywords",
+    })).filter((t) => t.url.startsWith("http"));
+
     console.log(`[Gemini Triage] Picked ${triaged.length} promising URLs:`);
     for (const t of triaged) {
       console.log(`  - [${t.url}] -> Reason: ${t.reason}`);
@@ -362,9 +405,17 @@ Return a JSON array, max 10 items:
 
   try {
     const result = await callGeminiJson(prompt);
-    if (!Array.isArray(result)) return [];
+    let itemsArray: any[] = [];
+    if (Array.isArray(result)) {
+      itemsArray = result;
+    } else if (result && typeof result === "object") {
+      if (Array.isArray(result.opportunities)) itemsArray = result.opportunities;
+      else if (Array.isArray(result.items)) itemsArray = result.items;
+      else if (Array.isArray(result.results)) itemsArray = result.results;
+      else if (Array.isArray(result.data)) itemsArray = result.data;
+    }
 
-    const items: Opportunity[] = result.map((item: any) => ({
+    const items: Opportunity[] = itemsArray.map((item: any) => ({
       title: item.title || "Untitled Opportunity",
       organization: item.organization || sourceName,
       type: item.type || "Internship",
