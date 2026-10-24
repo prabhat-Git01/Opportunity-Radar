@@ -56,7 +56,7 @@ async function callNemotronJson(prompt: string): Promise<any> {
   }
 
   const baseUrl = (process.env.NEMOTRON_BASE_URL?.trim() || "https://integrate.api.nvidia.com/v1").replace(/\/+$/, "");
-  const model = process.env.NEMOTRON_MODEL?.trim() || "nvidia/llama-3.1-nemotron-70b-instruct";
+  const model = process.env.NEMOTRON_MODEL?.trim() || "nvidia/nemotron-3.5-super-vl-120b-a12b";
 
   console.log(`[Nemotron] Calling model "${model}" via ${baseUrl}...`);
 
