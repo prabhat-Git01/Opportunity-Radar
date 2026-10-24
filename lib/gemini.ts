@@ -52,7 +52,7 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 async function callGeminiJson(prompt: string): Promise<any> {
   const { ai, model: primaryModel } = getGeminiClient();
   const modelsToTry = Array.from(
-    new Set([primaryModel, "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"])
+    new Set([primaryModel, "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash"])
   );
 
   let lastError: any = null;
