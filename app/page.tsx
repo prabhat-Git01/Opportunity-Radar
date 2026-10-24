@@ -170,6 +170,7 @@ export default function OpportunityRadarPage() {
       const decoder = new TextDecoder();
       let buffer = "";
 
+      let receivedDone = false;
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
@@ -209,6 +210,7 @@ export default function OpportunityRadarPage() {
             }
 
             if (event.stage === "done" && event.data) {
+              receivedDone = true;
               if (event.data.opportunities) {
                 setOpportunities(event.data.opportunities);
               }
@@ -232,6 +234,10 @@ export default function OpportunityRadarPage() {
             console.error("Failed to parse SSE event:", jsonStr, jsonErr);
           }
         }
+      }
+
+      if (!receivedDone) {
+        setIsSearching(false);
       }
     } catch (err: any) {
       console.error("Search pipeline error:", err);

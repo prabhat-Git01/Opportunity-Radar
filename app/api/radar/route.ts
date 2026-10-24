@@ -42,6 +42,13 @@ export async function POST(req: NextRequest) {
           }
         }
 
+        // Keep-alive heartbeat every 3s to prevent browser/proxy connection drops
+        const heartbeat = setInterval(() => {
+          try {
+            controller.enqueue(encoder.encode(": keepalive\n\n"));
+          } catch {}
+        }, 3000);
+
         try {
           await runOpportunityPipeline(input, (event) => {
             sendEvent(event);
@@ -65,6 +72,7 @@ export async function POST(req: NextRequest) {
             data: { error: friendly },
           });
         } finally {
+          clearInterval(heartbeat);
           try {
             controller.close();
           } catch {}

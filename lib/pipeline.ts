@@ -342,15 +342,22 @@ export async function runOpportunityPipeline(
       if (bIsTriaged !== aIsTriaged) return bIsTriaged - aIsTriaged;
       return b.chars - a.chars;
     })
-    .slice(0, 8); // Top 8 high-relevance pages
+    .slice(0, 6); // Top 6 high-relevance pages for fast response
 
   console.log(`[Pipeline Step 5] Extracting from top ${pagesToExtract.length} high-confidence pages...`);
 
+  let completedPages = 0;
   const extractionResults = await runWithConcurrency(
     pagesToExtract,
-    2, // Pace with 2 parallel calls to stay within Gemini RPM quotas
+    2, // Pace with 2 parallel calls to stay within RPM quotas
     async (page, idx) => {
       const srcName = page.sourceName || sourceNameMap[page.url] || getDomain(page.url) || "Web";
+      onProgress({
+        stage: "matching",
+        message: `Analyzing live opportunities in ${srcName} (${completedPages + 1}/${pagesToExtract.length})...`,
+        stepIndex: 4,
+      });
+
       const opps = await geminiExtractAndMatch(
         page.text,
         page.url,
@@ -359,6 +366,14 @@ export async function runOpportunityPipeline(
         understanding.keywords,
         input.profile
       );
+
+      completedPages++;
+      onProgress({
+        stage: "matching",
+        message: `Extracted ${opps.length} opportunities from ${srcName} (${completedPages}/${pagesToExtract.length})`,
+        stepIndex: 4,
+      });
+
       return { url: page.url, opportunities: opps };
     }
   );
