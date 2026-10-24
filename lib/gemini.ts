@@ -18,7 +18,7 @@ function getGeminiClient(): { ai: GoogleGenAI; model: string } {
 }
 
 /**
- * Clean and parse JSON returned from Gemini (handles markdown code fences if any)
+ * Clean and parse JSON returned from LLMs (handles markdown code fences if any)
  */
 function parseJsonFromText(rawText: string | undefined): any {
   if (!rawText) return null;
@@ -47,68 +47,142 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
 }
 
 /**
- * Helper to call Gemini generateContent with retries and fallback models
+ * Helper to call NVIDIA Nemotron (via NVIDIA NIM or OpenRouter / OpenAI-compatible endpoint)
  */
-async function callGeminiJson(prompt: string): Promise<any> {
-  const { ai, model: primaryModel } = getGeminiClient();
-  const modelsToTry = Array.from(
-    new Set([primaryModel, "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash"])
+async function callNemotronJson(prompt: string): Promise<any> {
+  const apiKey = process.env.NEMOTRON_API_KEY?.trim();
+  if (!apiKey || apiKey.includes("your_nemotron_api_key")) {
+    throw new Error("NEMOTRON_API_KEY is not configured in .env.local");
+  }
+
+  const baseUrl = (process.env.NEMOTRON_BASE_URL?.trim() || "https://integrate.api.nvidia.com/v1").replace(/\/+$/, "");
+  const model = process.env.NEMOTRON_MODEL?.trim() || "nvidia/llama-3.1-nemotron-70b-instruct";
+
+  console.log(`[Nemotron] Calling model "${model}" via ${baseUrl}...`);
+
+  const response = await withTimeout(
+    fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are an expert AI assistant. You MUST return strictly valid JSON matching the user instructions without any conversational commentary or markdown codeblocks outside JSON.",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+        temperature: 0.2,
+        max_tokens: 4096,
+      }),
+    }),
+    35000,
+    "Nemotron API request timed out after 35s"
   );
 
-  let lastError: any = null;
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Nemotron API error ${response.status}: ${errorText}`);
+  }
 
-  for (const model of modelsToTry) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        console.log(`[Gemini] Calling ${model} (attempt ${attempt + 1})...`);
-        const response = await withTimeout(
-          ai.models.generateContent({
-            model: model,
-            contents: prompt,
-            config: {
-              responseMimeType: "application/json",
-            },
-          }),
-          25000,
-          `Model ${model} timed out after 25s`
-        );
+  const data = await response.json();
+  const rawText = data?.choices?.[0]?.message?.content;
+  return parseJsonFromText(rawText);
+}
 
-        return parseJsonFromText(response.text);
-      } catch (err: any) {
-        lastError = err;
-        const errMsg = err?.message || "";
-        console.warn(`[Gemini] Model ${model} attempt ${attempt + 1} failed: ${errMsg}`);
+/**
+ * Helper to call Gemini generateContent with retries and fallback to Nemotron
+ */
+async function callGeminiJson(prompt: string): Promise<any> {
+  let geminiError: any = null;
+  const geminiApiKey = process.env.GEMINI_API_KEY?.trim();
 
-        // If daily quota exceeded or model discontinued, do NOT retry this model; switch immediately
-        if (
-          errMsg.includes("per day") ||
-          errMsg.includes("exceeded your current quota") ||
-          errMsg.includes("not found") ||
-          errMsg.includes("no longer available")
-        ) {
-          console.log(`[Gemini] Model ${model} quota exhausted or unavailable. Switching to alternative model...`);
-          break;
+  // Try Gemini models if GEMINI_API_KEY is provided
+  if (geminiApiKey && !geminiApiKey.includes("your_gemini_api_key")) {
+    try {
+      const { ai, model: primaryModel } = getGeminiClient();
+      const modelsToTry = Array.from(
+        new Set([primaryModel, "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash"])
+      );
+
+      for (const model of modelsToTry) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            console.log(`[Gemini] Calling ${model} (attempt ${attempt + 1})...`);
+            const response = await withTimeout(
+              ai.models.generateContent({
+                model: model,
+                contents: prompt,
+                config: {
+                  responseMimeType: "application/json",
+                },
+              }),
+              25000,
+              `Model ${model} timed out after 25s`
+            );
+
+            return parseJsonFromText(response.text);
+          } catch (err: any) {
+            geminiError = err;
+            const errMsg = err?.message || "";
+            console.warn(`[Gemini] Model ${model} attempt ${attempt + 1} failed: ${errMsg}`);
+
+            // If daily quota exceeded or model discontinued, do NOT retry this model; switch immediately
+            if (
+              errMsg.includes("per day") ||
+              errMsg.includes("exceeded your current quota") ||
+              errMsg.includes("not found") ||
+              errMsg.includes("no longer available")
+            ) {
+              console.log(`[Gemini] Model ${model} quota exhausted. Switching model...`);
+              break;
+            }
+
+            // If temporary RPM rate limit, wait 3s and retry once
+            if (errMsg.includes("requests per minute") || errMsg.includes("429")) {
+              console.log(`[Gemini] RPM limit on ${model}. Waiting 3s...`);
+              await new Promise((r) => setTimeout(r, 3000));
+              continue;
+            }
+
+            // If 503 high demand
+            if (errMsg.includes("503") || errMsg.includes("high demand")) {
+              await new Promise((r) => setTimeout(r, 2000));
+              continue;
+            }
+
+            break;
+          }
         }
-
-        // If temporary RPM rate limit, wait 3s and retry once
-        if (errMsg.includes("requests per minute") || errMsg.includes("429")) {
-          console.log(`[Gemini] RPM limit on ${model}. Waiting 3s...`);
-          await new Promise((r) => setTimeout(r, 3000));
-          continue;
-        }
-
-        // If 503 high demand
-        if (errMsg.includes("503") || errMsg.includes("high demand")) {
-          await new Promise((r) => setTimeout(r, 2000));
-          continue;
-        }
-
-        break;
       }
+    } catch (e: any) {
+      geminiError = e;
     }
   }
 
-  throw lastError;
+  // Seamless fallback to Nemotron if Gemini failed or is unavailable
+  const nemotronKey = process.env.NEMOTRON_API_KEY?.trim();
+  if (nemotronKey && !nemotronKey.includes("your_nemotron_api_key")) {
+    console.log("[LLM Fallback] Gemini models unavailable, falling back to NVIDIA Nemotron...");
+    try {
+      return await callNemotronJson(prompt);
+    } catch (nemotronErr: any) {
+      console.error("[Nemotron] Fallback call failed:", nemotronErr.message);
+      if (geminiError) throw geminiError;
+      throw nemotronErr;
+    }
+  }
+
+  if (geminiError) throw geminiError;
+  throw new Error("No available AI model. Please set GEMINI_API_KEY or NEMOTRON_API_KEY in .env.local");
 }
 
 /**
